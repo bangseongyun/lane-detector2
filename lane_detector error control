@@ -1,0 +1,262 @@
+import rclpy
+from rclpy.node import Node
+import cv2
+import numpy as np
+import math
+from geometry_msgs.msg import Twist #제어 명령을 위한 메시지 타입
+
+
+
+#제어 상수 설정
+#각속도(w) = kp x 오차(E)
+#Kp가 클수록 동일한 오차에 대해 더 큰 조향 명령, 작을수록 더 작은 조향 명령
+#차선을 무시하고 거의 직진만 한다면 kp가 너무 작음
+#차선을 따라가긴 하지만 곡선 구간에서 크게 이탈한다면 kp가 작음
+#로봇이 차선 중앙을 지나칠 때마다 좌우로 심하게 흔들린다면 kp가 큼
+KP = 0.02 #비례 상수(kp) 
+speed = 0.15 #직진 속도(m/s)
+Y_control= int(480 * 0.75) #Y 좌표 75%지점
+
+
+def main(args=None):
+    # ROS 2 초기화
+    rclpy.init(args=args)
+    #ROS 2 노드 객체 생성 (node 변수 정의)
+    node = rclpy.create_node('detect_node')
+    #Twist 메시지 발행을 위한 퍼블리셔 생성 (cmd_vel_publisher 정의)
+    cmd_vel_publisher = node.create_publisher(Twist, '/cmd_vel', 10)
+
+    #메인 실행 코드
+
+    #1. 카메라 연결 (0:외장 카메라, 2: 내장 카메라)
+    cap = cv2.VideoCapture(2)
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            print("프레임을 읽을 수 없습니다.") 
+            break 
+    
+        #연산 속도 향상을 위해 이미지 크기를 (640, 480)으로 고정
+        frame = cv2.resize(frame, (640, 480))
+        #frame.shape(높이, 가로 폭, 채널 수)
+        #frame.shape[:2] : 처음 두 개의 요소만 높이, 가로폭만 할당
+        height, width = frame.shape[:2]
+        line_draw = np.copy(frame) 
+
+        roi_y_start = height // 2  #높이의 절반부터
+        roi_y_end = height 
+        roi = frame[roi_y_start:roi_y_end, 0:width]
+
+        roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+        blur = cv2.GaussianBlur(roi_gray, (27, 27), 0)
+        
+        edges = cv2.Canny(blur, 20, 60)
+
+        lines = cv2.HoughLinesP(edges, 
+                                rho=1,              
+                                theta=np.pi/180,    
+                                threshold=40,       
+                                minLineLength=20,   
+                                maxLineGap=10) 
+        
+        #좌우 차선 분리 리스트 (왼쪽: 음수, 오른쪽: 양수)
+        #y2-y1(음수)/x2-x1(양수) = 음수
+        left_slopes = [] #왼쪽 기울기를 저장할 리스트 초기화
+        #y2-y1(양수)/x2-x1(양수) = 양수
+        right_slopes = [] #오른쪽 기울기를 저장할 리스트 초기화
+
+        #절편 계산에 사용할 좌표 리스트
+        left_coords = [] #모든 왼쪽 유효 선분의 좌표를 저장할 리스트 초기화
+        right_coords = [] #모든 오른쪽 유효 선분의 좌표를 저장할 리스트 초기화
+        
+        #차선 분리를 위한 중앙 x 좌표 (640 / 2 = 320)
+        center_x = width // 2 #기준선
+
+        if lines is not None:
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                
+                #ROI 좌표를 전체 프레임 좌표로 변환(올바른 기울기 계산, 선분을 정확한 위치에 그림)
+                #픽셀 크기 = 끝 좌표 - 시작 좌표 +1
+                #y1(0부터 239) + roi_y_start(240) = y1_orig(240부터 479)
+                y1_orig = y1 + roi_y_start 
+                #y2(0부터 239) + roi_y_start(240) = y2_orig(240부터 479)
+                y2_orig = y2 + roi_y_start
+
+                if x2 - x1 == 0:
+                    slope = np.inf
+                    continue #0인 수직선은 무시하고 다음 선분으로 넘어감
+                    #print(f"좌표: ({x1}, {y1_orig}) -> ({x2}, {y2_orig}), 기울기: 수직선 (inf)")
+                else:
+                    slope = (y2_orig - y1_orig) / (x2 - x1)
+                    #가로 방향에서 어디에 위치(중앙값)
+                    avg_x = (x1 + x2) // 2 #현재 처리 중인 선분의 가로 중앙값
+                    #print(f"좌표: ({x1}, {y1_orig}) -> ({x2}, {y2_orig}), 기울기: {slope:.2f}")
+
+                    #평균 기울기 계산을 위한 필터링 (기울기 10 미만)
+                    #10은 미니카 작동하면서 수정 10보다 작으면 직선 구간이 많거나 완만한 커브만 있는 길
+                    #10보다 크면 좁고 급커브가 많은 길
+                    if abs(slope) < 10: 
+                        #좌우 분리
+                        #기울기가 음수이고 평균x 좌표가 화면 중앙보다 작을때
+                        if slope < 0 and avg_x < center_x:
+                            #왼쪽 차선(음수 기울기, 화면 중앙 왼쪽)
+                            left_slopes.append(slope) #유효하다고 판단된 왼쪽 기울기 값을 리스트 저장
+                            left_coords.append([x1, y1_orig, x2, y2_orig]) #모든 왼쪽 유효 선분의 좌표를 리스트 저장
+                            #cv2.line(line_draw, (x1_line, y1_line), (x2_line, y2_line), (0, 255, 0), 2)
+                        #기울기가 양수이고 평균x 좌표가 화면 중앙보다 클때
+                        elif 0 < slope and center_x < avg_x:
+                            #오른쪽 차선: (양수 기울기, 화면 중앙 오른쪽)
+                            right_slopes.append(slope) #유효하다고 판단된 오른쪽 기울기 값을 리스트 저장
+                            right_coords.append([x1, y1_orig, x2, y2_orig]) #모든 오른쪽 유효 선분의 좌표를 리스트 저장
+                            #cv2.line(line_draw, (x1_line, y1_line), (x2_line, y2_line), (255, 0, 0), 2)
+            
+            if left_slopes: 
+                #평균 기울기 = sigma(유효한 기울기 값)/ 유효한 기울기 개수 계산
+                avg_left_slope = math.fsum(left_slopes) / len(left_slopes)
+                
+                #모든 유효 선분의 X, Y 좌표를 모아 평균을 구함
+                all_x = np.array([coord[i] for coord in left_coords for i in [0, 2]]) #X 좌표만 추출(리스트 컴프리헨션)
+                all_y = np.array([coord[i] for coord in left_coords for i in [1, 3]]) #Y 좌표만 추출(리스트 컴프리헨션)
+                avg_x = np.mean(all_x)
+                avg_y = np.mean(all_y)
+
+                #절편 b = y - mx 계산
+                avg_left_intercept = avg_y - (avg_left_slope * avg_x)
+
+                #선분 좌표 계산 (화면 하단부터 중앙까지)
+                y1_line = height #화면 하단 (가까운 지점)
+                #0.6보다 작으면 차선이 더 길게 그려져 먼 곳을 예측하나 불안정해질 수 있음
+                #0.6보다 크면 차선이 더 짧게 그려져 안정적이나 예측 거리가 줄어듦
+                y2_line = int(height * 0.6) #화면 중앙 위쪽 (먼 지점)
+                
+                #x = (y - b) / m 공식을 사용하여 X 좌표 계산(직선의 방정식)
+                x1_line = int((y1_line - avg_left_intercept) / avg_left_slope)
+                x2_line = int((y2_line - avg_left_intercept) / avg_left_slope)
+                
+                cv2.line(line_draw, (x1_line, y1_line), (x2_line, y2_line), (0, 255, 0), 10)
+                print(f"평균 왼쪽 기울기: {avg_left_slope:.2f}")
+            else:
+                avg_left_slope = None
+                print("평균 기울기를 계산할 유효한 선분이 부족함")
+            if right_slopes:
+                avg_right_slope = math.fsum(right_slopes) / len(right_slopes)
+
+                # 모든 유효 선분의 x, y 좌표를 모아 평균을 구함
+                all_x = np.array([coord[i] for coord in right_coords for i in [0, 2]]) #x 좌표만 추출(리스트 컴프리헨션)
+                all_y = np.array([coord[i] for coord in right_coords for i in [1, 3]]) #y 좌표만 추출(리스트 컴프리헨션)
+                avg_x = np.mean(all_x)
+                avg_y = np.mean(all_y)
+
+                #절편 b = y - mx 계산
+                avg_right_intercept = avg_y - (avg_right_slope * avg_x)
+                
+                #선분 좌표 계산(화면 하단부터 중앙까지)
+                y1_line = height #y 좌표의 최대값 (화면 하단, 차량에 가장 가까운 지점)
+                #0.6보다 작으면 차선이 더 길게 그려져 먼 곳을 예측하나 불안정해질 수 있음
+                #0.6보다 크면 차선이 더 짧게 그려져 안정적이나 예측 거리가 줄어듦
+                y2_line = int(height * 0.6) #Y 좌표의 중간값 (화면 중앙 위쪽, 차선이 끝나는 지점)
+                
+                #x = (y - b) / m 공식을 사용하여 X 좌표 계산(직선의 방정식)
+                x1_line = int((y1_line - avg_right_intercept) / avg_right_slope)
+                x2_line = int((y2_line - avg_right_intercept) / avg_right_slope)
+
+                cv2.line(line_draw, (x1_line, y1_line), (x2_line, y2_line), (255, 0, 0), 10)
+                print(f"평균 오른쪽 기울기: {avg_right_slope:.2f}")
+            else:
+                avg_right_slope = None
+                print("오른쪽 차선 기울기를 계산할 유효한 선분이 부족함")
+
+            #제어 로직
+                twist_msg = Twist() #속도 명령을 담을 빈 메시지 객체 생성(초기화), 속도명령상자
+                angular_z = 0.0 # 각속도(조향) 초기화
+                error = 0.0 #목표 지점과 실제 차선 중심 사이의 거리 차이(오차)를 저장할 변수 초기화
+            
+            #제어 기준 Y 좌표 (Y_control = 360)에서의 X 좌표 계산 변수
+                x_control_left = None #왼쪽 차선의 X 좌표를 초기화, 0으로 초기화로 하면 x 좌표가 0이라고 착각할 수 있음
+                x_control_right = None #오른쪽 차선의 X 좌표를 초기화, 0으로 초기화로 하면 x 좌표가 0이라고 착각할 수 있음
+
+            #왼쪽 차선의 제어 기준 X 좌표 계산 (기울기 m과 절편 b 사용)
+            #왼쪽 차선의 평균 기울기 값이 오류 없이 성공적으로 계산되었을 때에만 x_control_left를 계산
+            #차선이 감지되지 않아 변수가 아예 생성되지 않았을 때 발생하는 NameError를 방지
+            #변수 안에 값이 있지만 유효하지 않을 경우 발생하는 오류를 방지
+            if 'avg_left_slope' in locals() and avg_left_slope is not None:
+                #x = (y - b) / m
+                x_control_left = int((Y_control - avg_left_intercept) / avg_left_slope)
+                cv2.circle(line_draw, (x_control_left, Y_control), 10, (0, 255, 0), -1)
+
+            #오른쪽 차선의 제어 기준 X 좌표 계산
+            #오른쪽 차선의 평균 기울기 값이 오류 없이 성공적으로 계산되었을 때에만 x_control_right를 계산
+            #차선이 감지되지 않아 변수가 아예 생성되지 않았을 때 발생하는 NameError를 방지
+            #변수 안에 값이 있지만 유효하지 않을 경우 발생하는 오류를 방지
+            if 'avg_right_slope' in locals() and avg_right_slope is not None:
+                # x = (y - b) / m
+                x_control_right = int((Y_control - avg_right_intercept) / avg_right_slope)
+                #10: 원의 반지름, -1: 원의 선 두께(원의 내부 전체를 지정된 색상으로 채워서 그림)
+                cv2.circle(line_draw, (x_control_right, Y_control), 10, (255, 0, 0), -1)
+
+            #오차 계산: E = 화면 중심 - 차선 중심
+            #왼쪽 차선의 X 좌표와 오른쪽 차선의 X 좌표가 유효하게 계산했을 때
+            if x_control_left is not None and x_control_right is not None:
+                #양쪽 차선 감지: Y_control 지점의 중앙점을 목표로 설정
+                lane_center_x = (x_control_left + x_control_right) // 2
+                
+                #오차 계산: E = x_target - x_lane_center
+                error = center_x - lane_center_x
+                
+                #디버깅: 차선 중심선 표시
+                cv2.line(line_draw, (lane_center_x, Y_control - 20), (lane_center_x, Y_control + 20), (0, 255, 255), 5)
+            #왼쪽 차선만 유효한 좌표를 가지면
+            elif x_control_left is not None:
+                #왼쪽 차선만 감지: 왼쪽 차선으로부터 우측으로 150픽셀을 목표로 설정
+                target_offset = 150 
+                target_x = x_control_left + target_offset
+                error = center_x - target_x
+            
+            #오른쪽 차선만 유효한 좌표를 가지면
+            elif x_control_right is not None:
+                #오른쪽 차선만 감지: 오른쪽 차선으로부터 좌측으로 150픽셀을 목표로 설정
+                target_offset = 150
+                target_x = x_control_right - target_offset
+                error = center_x - target_x
+            else:
+                print('경고: 차선을 찾을 수 없음 (직진 유지)')
+                error = 0.0
+                
+            #각속도 명령 = KP * 오차
+            #픽셀 오차(E)를 각속도 명령(angular_z)으로 변환
+            angular_z = KP * error
+
+            #Twist 메시지 생성 및 발행
+            twist_msg.linear.x = speed #선형 속도(직진 속도) 설정
+            twist_msg.angular.z = angular_z #각속도(회전 속도/조향) 설정
+            #설정된 속도 명령(twist_msg)을 '/cmd_vel' 토픽에 발행하여 로봇에게 전달
+            cmd_vel_publisher.publish(twist_msg)
+            #현재 오차 값(Error)과 계산된 각속도(Angular Z)를 ROS 2 노드의 정보(info) 레벨로 기록
+            node.get_logger().info(f'Error: {error:.2f}, Angular Z: {angular_z:.2f}')
+
+
+        cv2.imshow("frame", frame)
+        cv2.imshow("roi", roi)
+        cv2.imshow("grayscale", roi_gray)
+        cv2.imshow("gaussian blur", blur)
+        cv2.imshow("canny edges", edges)
+        cv2.imshow("lane detection result", line_draw)
+
+        if cv2.waitKey(1) == ord('q'):
+            break
+        
+    # 카메라 장치 해제 및 모든 창 닫기
+    cap.release() 
+    cv2.destroyAllWindows()
+    #노드 객체 파괴
+    node.destroy_node() #생성한 노드 객체의 리소스를 먼저 정리
+    rclpy.shutdown() #ROS 2 라이브러리 전체를 종료
+# 스크립트를 직접 실행할 때 main 함수 호출
+if __name__ == '__main__':
+    main()
